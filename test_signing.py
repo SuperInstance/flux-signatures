@@ -201,6 +201,107 @@ class TestHashChain(unittest.TestCase):
         valid, _ = chain.verify_snapshot(seq)
         self.assertTrue(valid)
 
+    def test_verify_snapshot_rejects_rewritten_history(self):
+        """A snapshot must fail on the same rewrite verify_chain() rejects.
+
+        This is the defect: verify_snapshot used to compute a hash, compare it
+        to nothing, and return True. The snapshot verifier blessed a chain the
+        chain verifier had just called tampered.
+        """
+        chain = HashChain()
+        chain.append("h0", "a0")
+        chain.append("h1", "a1")
+        seq, _ = chain.create_snapshot()
+
+        chain.links[0].program_hash = "rewritten"
+
+        # Precondition: the chain verifier must reject this rewrite, otherwise
+        # there is nothing for the snapshot verifier to agree with.
+        chain_valid, chain_msg = chain.verify_chain()
+        self.assertFalse(chain_valid, f"precondition: verify_chain accepted the rewrite ({chain_msg})")
+
+        snapshot_valid, snapshot_msg = chain.verify_snapshot(seq)
+        self.assertFalse(
+            snapshot_valid,
+            f"verify_snapshot blessed a rewritten chain: {snapshot_msg}",
+        )
+
+    def test_verify_snapshot_rejects_rewritten_agent(self):
+        chain = HashChain()
+        chain.append("h0", "a0")
+        chain.append("h1", "a1")
+        seq, _ = chain.create_snapshot()
+
+        chain.links[1].agent_id = "attacker"
+        snapshot_valid, snapshot_msg = chain.verify_snapshot(seq)
+        self.assertFalse(snapshot_valid, snapshot_msg)
+
+    def test_verify_snapshot_rejects_metadata_tamper(self):
+        """link_hash does not cover metadata, so only the snapshot sees this."""
+        chain = HashChain()
+        chain.append("h0", "a0", {"note": "original"})
+        chain.append("h1", "a1")
+        seq, _ = chain.create_snapshot()
+
+        chain.links[0].metadata["note"] = "swapped"
+        snapshot_valid, snapshot_msg = chain.verify_snapshot(seq)
+        self.assertFalse(snapshot_valid, snapshot_msg)
+
+    def test_verify_snapshot_missing_and_out_of_range(self):
+        chain = HashChain()
+        chain.append("h0", "a0")
+
+        valid, msg = chain.verify_snapshot(0)
+        self.assertFalse(valid)
+        self.assertIn("no snapshot", msg)
+
+        valid, msg = chain.verify_snapshot(99)
+        self.assertFalse(valid)
+        self.assertIn("no snapshot", msg)
+
+    def test_verify_snapshot_out_of_range(self):
+        """A snapshot whose links are gone is out of range, not valid."""
+        chain = HashChain()
+        chain.append("h0", "a0")
+        chain.append("h1", "a1")
+        seq, _ = chain.create_snapshot()
+        del chain.links[seq]
+        valid, msg = chain.verify_snapshot(seq)
+        self.assertFalse(valid)
+        self.assertEqual(msg, "sequence out of range")
+
+        # An empty chain snapshots at seq -1, which is not a sequence.
+        empty = HashChain()
+        neg_seq, _ = empty.create_snapshot()
+        self.assertEqual(neg_seq, -1)
+        valid, msg = empty.verify_snapshot(neg_seq)
+        self.assertFalse(valid)
+        self.assertEqual(msg, "sequence out of range")
+
+    def test_snapshot_unaffected_by_later_appends(self):
+        """A snapshot pins a prefix. Growth after it must not invalidate it."""
+        chain = HashChain()
+        chain.append("h0", "a0")
+        seq, _ = chain.create_snapshot()
+        chain.append("h1", "a1")
+        valid, msg = chain.verify_snapshot(seq)
+        self.assertTrue(valid, msg)
+
+    def test_snapshot_survives_serialization(self):
+        chain = HashChain()
+        chain.append("h0", "a0")
+        chain.append("h1", "a1")
+        seq, snap_hash = chain.create_snapshot()
+
+        restored = HashChain.from_dict(chain.to_dict())
+        self.assertEqual(restored.snapshots.get(seq), snap_hash)
+        valid, msg = restored.verify_snapshot(seq)
+        self.assertTrue(valid, msg)
+
+        restored.links[0].program_hash = "rewritten"
+        valid, msg = restored.verify_snapshot(seq)
+        self.assertFalse(valid, msg)
+
     def test_get_history_range(self):
         chain = HashChain()
         for i in range(5):

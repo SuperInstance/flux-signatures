@@ -27,4 +27,4 @@ jobs:
           pip install pytest
 
       - name: Run tests
-        run: pytest tests/ -v
+        run: pytest tests/ test_signing.py -v
