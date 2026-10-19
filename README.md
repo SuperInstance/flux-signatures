@@ -56,7 +56,7 @@ print(result.to_markdown())
 ## Running Tests
 
 ```bash
-python -m pytest tests/ -v
+python -m pytest tests/ test_signing.py -v
 # or
 python signatures.py
 ```

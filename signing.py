@@ -333,24 +333,44 @@ class HashChain:
             return self.links[sequence]
         return None
 
+    def _snapshot_digest(self, seq: int) -> str:
+        """Digest of the chain prefix links[0..seq].
+
+        create_snapshot() and verify_snapshot() both read this, so the digest a
+        snapshot is checked against is by construction the digest it was made
+        from.
+        """
+        snapshot_data = json.dumps(
+            {"links": [l.to_dict() for l in self.links[:seq + 1]]}, sort_keys=True
+        )
+        return _sha256(snapshot_data.encode())
+
     def create_snapshot(self) -> Tuple[int, str]:
         """Create a checkpoint snapshot of the chain at current state."""
         seq = len(self.links) - 1
-        snapshot_data = json.dumps(self.to_dict(), sort_keys=True)
-        snapshot_hash = _sha256(snapshot_data.encode())
+        snapshot_hash = self._snapshot_digest(seq)
         self.snapshots[seq] = snapshot_hash
         return seq, snapshot_hash
 
     def verify_snapshot(self, seq: int) -> Tuple[bool, str]:
-        """Verify a previously created snapshot is still valid."""
+        """Verify a previously created snapshot is still valid.
+
+        Recomputes the digest over links[0..seq] and compares it against the
+        digest recorded when the snapshot was taken. A history that no longer
+        re-derives fails here for the same reason it fails verify_chain(): a
+        snapshot is evidence, and evidence that is not re-derived is not
+        evidence.
+        """
         if seq not in self.snapshots:
             return False, f"no snapshot at sequence {seq}"
-        # We can only verify the snapshot matches if chain hasn't changed before seq
+        if seq < 0 or seq >= len(self.links):
+            return False, "sequence out of range"
         snapshot_hash = self.snapshots[seq]
-        if seq < len(self.links):
-            current_hash = self.links[seq].link_hash
-            return True, f"snapshot valid at sequence {seq} (tip_hash={snapshot_hash[:16]}...)"
-        return False, "sequence out of range"
+        current_hash = self._snapshot_digest(seq)
+        if current_hash != snapshot_hash:
+            return False, (f"snapshot mismatch at sequence {seq}: chain no longer "
+                           f"re-derives to {snapshot_hash[:16]}...")
+        return True, f"snapshot valid at sequence {seq} (tip_hash={snapshot_hash[:16]}...)"
 
     def get_history(self, start: int = 0, end: Optional[int] = None) -> List[ChainLink]:
         """Get a range of chain links."""
@@ -376,12 +396,14 @@ class HashChain:
         return len(pruned)
 
     def to_dict(self) -> dict:
-        return {"links": [l.to_dict() for l in self.links]}
+        return {"links": [l.to_dict() for l in self.links],
+                "snapshots": dict(self.snapshots)}
 
     @classmethod
     def from_dict(cls, d: dict) -> "HashChain":
         links = [ChainLink.from_dict(l) for l in d.get("links", [])]
-        return cls(links=links)
+        snapshots = {int(k): v for k, v in d.get("snapshots", {}).items()}
+        return cls(links=links, snapshots=snapshots)
 
 
 # ── Multi-Signature ─────────────────────────────────────────────────────────
