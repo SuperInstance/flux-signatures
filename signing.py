@@ -260,7 +260,21 @@ class ChainLink:
 
 @dataclass
 class HashChain:
-    """Hash chain providing tamper-evident program version history."""
+    """Hash chain providing attestable (re-derivable) program version history.
+
+    NOT tamper-evident, and the missing leg is leg 3. The rest of this module is
+    real signing: agents hold keys, keys rotate, signatures expire and are
+    revoked, approval is weighted. So a head signed under an agent key would be
+    leg 2. But no head is ever published somewhere the log writer does not
+    control, and the writer holds the keys — there is no anchor, and no anchor
+    is leg 3. Without it an attacker who re-chains an edit verifies perfectly,
+    and a truncated chain is a shorter valid chain.
+
+    So the chain alone is `attestable`: it re-derives, an edit is expensive, and
+    a naive edit is named by verify_chain(). It becomes tamper-evident when the
+    tip is signed under a key the writer does not hold and published where the
+    writer does not control it. Nothing in this module does that.
+    """
     links: List[ChainLink] = field(default_factory=list)
     snapshots: Dict[int, str] = field(default_factory=dict)  # seq -> snapshot hash
 
