@@ -15,6 +15,13 @@ Provides a complete cryptographic infrastructure for FLUX bytecode programs:
   - Audit logging
   - Threshold/weighted multi-sig
   - Hash chain snapshots
+
+Signing is HMAC-SHA256 and is symmetric by design: sign() and verify() use the
+same secret, so a verifier must hold the agent's secret. There is no public key
+in this module and no asymmetric leg. What an agent publishes is a
+`key_fingerprint` — sha256 of the secret — which names a key generation and
+verifies nothing. Key custody is the operator's: secrets are never written by
+to_dict()/export_state(), and are supplied on import.
 """
 from __future__ import annotations
 
@@ -25,7 +32,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Tuple, Set
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Set
 
 
 # ── Utility ──────────────────────────────────────────────────────────────────
@@ -84,30 +91,48 @@ class AuditAction(Enum):
 
 @dataclass
 class AgentIdentity:
-    """Represents a FLUX fleet agent with signing capabilities."""
+    """A FLUX fleet agent with signing capabilities.
+
+    Signing here is HMAC-SHA256, which is symmetric by choice: sign() and
+    verify() use the same secret. That is a legitimate design, but it has one
+    consequence worth stating plainly — **a verifier must hold the agent's
+    secret**. There is no public key, and nothing in this module is a public
+    key.
+
+    What this module carries instead is `key_fingerprint`: sha256 of the secret,
+    hex-encoded. It is a *name* for a key generation — it identifies which
+    secret signed, it is safe to publish, and it verifies nothing at all. It was
+    previously called `public_key`, which was a lie in the type system: a hash of
+    the secret that no verifier could use.
+
+    Because verification needs the secret, custody is the operator's job. Keep
+    secrets in whatever the fleet already keeps secrets in and supply them on
+    import via AgentIdentity.from_dict / SigningEngine.import_state. They are
+    never written into to_dict() or export_state().
+    """
     agent_id: str
     name: str
-    public_key: str  # hex-encoded (derived: sha256 of private_key)
+    key_fingerprint: str  # hex sha256 of the secret. Identifies a key generation. Verifies nothing.
     private_key: str  # hex-encoded secret key
     role: AgentRole = AgentRole.AUTHOR
     created_at: float = field(default_factory=time.time)
     is_active: bool = True
-    previous_keys: List[str] = field(default_factory=list)  # key rotation history
+    previous_keys: List[str] = field(default_factory=list)  # rotated-out secrets, kept to verify old signatures
 
     @classmethod
     def generate(cls, agent_id: str, name: str, role: AgentRole = AgentRole.AUTHOR) -> "AgentIdentity":
-        """Generate a new agent with a random 256-bit key pair."""
+        """Generate a new agent with a random 256-bit secret."""
         private_key = uuid.uuid4().hex + uuid.uuid4().hex  # 256-bit
-        public_key = _sha256(private_key.encode())
-        return cls(agent_id=agent_id, name=name, public_key=public_key,
+        key_fingerprint = _sha256(private_key.encode())
+        return cls(agent_id=agent_id, name=name, key_fingerprint=key_fingerprint,
                    private_key=private_key, role=role)
 
     def sign(self, data: bytes) -> str:
-        """Sign arbitrary data with this agent's private key."""
+        """Sign arbitrary data with this agent's secret (HMAC)."""
         return _hmac_sign(self.private_key.encode(), data)
 
     def verify(self, data: bytes, signature: str) -> bool:
-        """Verify a signature against this agent's key."""
+        """Verify a signature. Requires the secret — HMAC is symmetric."""
         # Try current key first, then historical keys
         if _hmac_verify(self.private_key.encode(), data, signature):
             return True
@@ -117,12 +142,17 @@ class AgentIdentity:
         return False
 
     def rotate_key(self) -> str:
-        """Rotate to a new key pair. Returns new public key. Old key kept for verification."""
+        """Rotate to a new secret. Returns the new key_fingerprint.
+
+        The old secret is kept in previous_keys so signatures made before the
+        rotation still verify — which is also why previous_keys are secrets the
+        operator must retain and supply again on import.
+        """
         self.previous_keys.append(self.private_key)
         new_private = uuid.uuid4().hex + uuid.uuid4().hex
         self.private_key = new_private
-        self.public_key = _sha256(new_private.encode())
-        return self.public_key
+        self.key_fingerprint = _sha256(new_private.encode())
+        return self.key_fingerprint
 
     @property
     def key_generation(self) -> int:
@@ -130,15 +160,57 @@ class AgentIdentity:
         return len(self.previous_keys)
 
     def to_dict(self) -> dict:
+        """Public record of the agent. Carries the fingerprint, never the secret."""
         return {
             "agent_id": self.agent_id,
             "name": self.name,
-            "public_key": self.public_key,
+            "key_fingerprint": self.key_fingerprint,
             "role": self.role.value,
             "created_at": self.created_at,
             "is_active": self.is_active,
             "key_generation": self.key_generation,
         }
+
+    @classmethod
+    def from_dict(cls, d: dict, private_key: str,
+                  previous_keys: Sequence[str] = ()) -> "AgentIdentity":
+        """Rebuild an agent from to_dict() plus the secrets, held separately.
+
+        to_dict() never carries a secret, so an export on its own is a record,
+        not a working agent. Custody is the caller's: read `private_key` from
+        wherever the fleet keeps secrets and pass it in.
+
+        The fingerprint is recomputed from the supplied secret and checked
+        against the recorded one, so a mismatched key is refused rather than
+        silently accepted. `previous_keys` must hold one secret per recorded
+        key_generation, in rotation order — without them, signatures made before
+        the last rotation would silently stop verifying, so that is an error
+        rather than a silent loss of verifiability.
+        """
+        fingerprint = _sha256(private_key.encode())
+        if d.get("key_fingerprint") != fingerprint:
+            raise ValueError(
+                f"private key does not match the recorded key_fingerprint for "
+                f"agent {d.get('agent_id')!r}"
+            )
+        previous_keys = list(previous_keys)
+        generations = d.get("key_generation", 0)
+        if len(previous_keys) != generations:
+            raise ValueError(
+                f"agent {d.get('agent_id')!r} has {generations} rotated key(s) but "
+                f"{len(previous_keys)} historical secret(s) were supplied; "
+                f"signatures made before the last rotation would not verify"
+            )
+        return cls(
+            agent_id=d["agent_id"],
+            name=d.get("name", ""),
+            key_fingerprint=fingerprint,
+            private_key=private_key,
+            role=AgentRole(d.get("role", AgentRole.AUTHOR.value)),
+            created_at=d.get("created_at", 0.0),
+            is_active=d.get("is_active", True),
+            previous_keys=previous_keys,
+        )
 
 
 # ── Program Signature ───────────────────────────────────────────────────────
@@ -431,6 +503,15 @@ class MultiSignature:
             "description": self.description,
         }
 
+    @classmethod
+    def from_dict(cls, d: dict) -> "MultiSignature":
+        return cls(
+            program_hash=d["program_hash"],
+            signatures=[ProgramSignature.from_dict(s) for s in d.get("signatures", [])],
+            required_approvals=d.get("required_approvals", 1),
+            description=d.get("description", ""),
+        )
+
 
 # ── Weighted/Threshold Signatures ────────────────────────────────────────────
 
@@ -486,6 +567,16 @@ class WeightedApproval:
             "description": self.description,
         }
 
+    @classmethod
+    def from_dict(cls, d: dict) -> "WeightedApproval":
+        return cls(
+            program_hash=d["program_hash"],
+            agent_weights=dict(d.get("agent_weights", {})),
+            required_threshold=d.get("required_threshold", 1),
+            signatures=[ProgramSignature.from_dict(s) for s in d.get("signatures", [])],
+            description=d.get("description", ""),
+        )
+
 
 # ── Revocation List ─────────────────────────────────────────────────────────
 
@@ -497,6 +588,17 @@ class RevocationEntry:
     revoked_by: str
     reason: str
     timestamp: float = field(default_factory=time.time)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "RevocationEntry":
+        return cls(
+            signature_hash=d["signature_hash"],
+            program_hash=d["program_hash"],
+            agent_id=d["agent_id"],
+            revoked_by=d["revoked_by"],
+            reason=d.get("reason", ""),
+            timestamp=d.get("timestamp", 0.0),
+        )
 
 
 # ── Audit Log ───────────────────────────────────────────────────────────────
@@ -525,6 +627,17 @@ class AuditEntry:
             "timestamp": self.timestamp,
             "entry_hash": self.entry_hash,
         }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "AuditEntry":
+        return cls(
+            action=AuditAction(d["action"]),
+            actor=d["actor"],
+            target=d["target"],
+            details=d.get("details", {}),
+            timestamp=d.get("timestamp", 0.0),
+            entry_hash=d.get("entry_hash", ""),
+        )
 
 
 # ── Signing Engine (main facade) ────────────────────────────────────────────
@@ -566,7 +679,7 @@ class SigningEngine:
     def register_agent(self, agent: AgentIdentity) -> None:
         """Register an agent identity."""
         self.agents[agent.agent_id] = agent
-        self._audit(AuditAction.AGENT_REGISTERED, agent.agent_id, agent.public_key)
+        self._audit(AuditAction.AGENT_REGISTERED, agent.agent_id, agent.key_fingerprint)
 
     def get_agent(self, agent_id: str) -> Optional[AgentIdentity]:
         return self.agents.get(agent_id)
@@ -580,14 +693,14 @@ class SigningEngine:
         return False
 
     def rotate_agent_key(self, agent_id: str) -> Optional[str]:
-        """Rotate an agent's key. Returns new public key or None."""
+        """Rotate an agent's secret. Returns the new key_fingerprint or None."""
         agent = self.agents.get(agent_id)
         if not agent:
             return None
-        new_pub = agent.rotate_key()
-        self._audit(AuditAction.AGENT_KEY_ROTATED, agent_id, new_pub,
+        new_fingerprint = agent.rotate_key()
+        self._audit(AuditAction.AGENT_KEY_ROTATED, agent_id, new_fingerprint,
                     {"generation": agent.key_generation})
-        return new_pub
+        return new_fingerprint
 
     # ── Signing ──
 
@@ -912,6 +1025,12 @@ class SigningEngine:
     # ── Serialization ──
 
     def export_state(self) -> dict:
+        """Export everything except the agent secrets.
+
+        An export on its own is a *record*, not a working engine: verification
+        is HMAC and needs the secret, which never appears here. Pair it with
+        import_state() and the secrets to get a verifiable engine back.
+        """
         return {
             "agents": {aid: a.to_dict() for aid, a in self.agents.items()},
             "signatures": {h: [s.to_dict() for s in sigs] for h, sigs in self.signatures.items()},
@@ -930,3 +1049,50 @@ class SigningEngine:
             "audit_log": [e.to_dict() for e in self.audit_log],
             "default_ttl": self.default_ttl,
         }
+
+    def import_state(self, state: dict,
+                     agent_secrets: Dict[str, str],
+                     agent_history: Optional[Dict[str, Sequence[str]]] = None) -> "SigningEngine":
+        """Rebuild an engine from export_state() plus the agent secrets.
+
+        agent_secrets maps agent_id -> current secret, read from wherever the
+        fleet keeps secrets; export_state() deliberately never carries them.
+        agent_history maps agent_id -> rotated-out secrets in rotation order,
+        and is required for any agent that has rotated (see
+        AgentIdentity.from_dict) so that pre-rotation signatures keep verifying.
+
+        This is the inverse of export_state(). Without it, an exported signature
+        set could never be verified again by this process.
+        """
+        agent_history = agent_history or {}
+        missing = sorted(a for a in state.get("agents", {}) if a not in agent_secrets)
+        if missing:
+            raise ValueError(
+                "no secret supplied for agent(s): " + ", ".join(missing) +
+                "; HMAC verification requires the secret, not the fingerprint"
+            )
+
+        engine = SigningEngine(default_ttl=state.get("default_ttl"))
+        for aid, d in state.get("agents", {}).items():
+            engine.agents[aid] = AgentIdentity.from_dict(
+                d, agent_secrets[aid], agent_history.get(aid, ())
+            )
+        engine.signatures = {
+            h: [ProgramSignature.from_dict(s) for s in sigs]
+            for h, sigs in state.get("signatures", {}).items()
+        }
+        engine.hash_chain = HashChain.from_dict(state.get("hash_chain", {}))
+        engine.revocations = {
+            sh: RevocationEntry.from_dict(e) for sh, e in state.get("revocations", {}).items()
+        }
+        engine.multi_sigs = {
+            h: MultiSignature.from_dict(ms) for h, ms in state.get("multi_sigs", {}).items()
+        }
+        engine.weighted_sigs = {
+            h: WeightedApproval.from_dict(ws) for h, ws in state.get("weighted_sigs", {}).items()
+        }
+        engine.commit_links = {
+            ch: CommitLink.from_dict(cl) for ch, cl in state.get("commit_links", {}).items()
+        }
+        engine.audit_log = [AuditEntry.from_dict(e) for e in state.get("audit_log", [])]
+        return engine
