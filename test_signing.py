@@ -4,6 +4,7 @@ Tests: signing, verification, hash chains, multi-sig, revocation,
        expiry, key rotation, commit linking, batch verify, audit log,
        weighted signatures, snapshots, pruning, and serialization.
 """
+import json
 import time
 import unittest
 
@@ -72,9 +73,9 @@ class TestAgentIdentity(unittest.TestCase):
     def test_key_rotation(self):
         agent = AgentIdentity.generate("a3", "Dave")
         old_key = agent.private_key
-        new_pub = agent.rotate_key()
+        new_fingerprint = agent.rotate_key()
         self.assertNotEqual(old_key, agent.private_key)
-        self.assertEqual(new_pub, agent.public_key)
+        self.assertEqual(new_fingerprint, agent.key_fingerprint)
         self.assertEqual(agent.key_generation, 1)
 
     def test_verify_after_rotation(self):
@@ -108,7 +109,8 @@ class TestAgentIdentity(unittest.TestCase):
         d = agent.to_dict()
         self.assertEqual(d["agent_id"], "a7")
         self.assertEqual(d["name"], "Heidi")
-        self.assertIn("public_key", d)
+        self.assertIn("key_fingerprint", d)
+        self.assertNotIn("public_key", d)  # no such thing: signing is symmetric
         self.assertNotIn("private_key", d)  # never export private key
 
 
@@ -530,6 +532,149 @@ class TestSigningEngine(unittest.TestCase):
         self.assertIn("hash_chain", state)
         self.assertIn("audit_log", state)
         self.assertIn("agent-1", state["agents"])
+
+
+class TestKeyFingerprintAndCustody(unittest.TestCase):
+    """The field called `public_key` was sha256 of the secret and verified nothing.
+
+    Signing here is HMAC and is symmetric by choice. The defect was the name and
+    the missing custody, not the choice of HMAC — so these tests pin the honest
+    property and the round trip.
+    """
+
+    def test_fingerprint_is_not_a_verification_key(self):
+        """A fingerprint names a key generation. It must not verify anything.
+
+        If key_fingerprint could verify a signature it would be a public key.
+        It cannot, so nothing may claim that it does.
+        """
+        agent = AgentIdentity.generate("fp-1", "Fingerprint")
+        sig = agent.sign(b"payload")
+        self.assertFalse(
+            _hmac_verify(agent.key_fingerprint.encode(), b"payload", sig),
+            "key_fingerprint must not be usable as a verification key",
+        )
+        self.assertTrue(agent.verify(b"payload", sig))
+
+    def test_fingerprint_is_sha256_of_the_secret(self):
+        agent = AgentIdentity.generate("fp-2", "Fingerprint")
+        self.assertEqual(agent.key_fingerprint, _sha256(agent.private_key.encode()))
+
+    def test_fingerprint_is_safe_to_publish(self):
+        agent = AgentIdentity.generate("fp-3", "Fingerprint")
+        d = agent.to_dict()
+        self.assertNotIn(agent.private_key, json.dumps(d))
+        self.assertIn(agent.key_fingerprint, json.dumps(d))
+
+    def test_fingerprint_changes_on_rotation(self):
+        agent = AgentIdentity.generate("fp-4", "Fingerprint")
+        before = agent.key_fingerprint
+        self.assertNotEqual(agent.rotate_key(), before)
+        self.assertEqual(agent.key_fingerprint, _sha256(agent.private_key.encode()))
+
+    def test_from_dict_rejects_a_key_that_does_not_match(self):
+        agent = AgentIdentity.generate("fp-5", "Fingerprint")
+        d = agent.to_dict()
+        with self.assertRaises(ValueError):
+            AgentIdentity.from_dict(d, "not-the-secret")
+
+    def test_from_dict_round_trip(self):
+        agent = AgentIdentity.generate("fp-6", "Fingerprint")
+        d = agent.to_dict()
+        restored = AgentIdentity.from_dict(d, agent.private_key)
+        self.assertEqual(restored.agent_id, agent.agent_id)
+        self.assertEqual(restored.key_fingerprint, agent.key_fingerprint)
+        sig = agent.sign(b"round trip")
+        self.assertTrue(restored.verify(b"round trip", sig))
+
+    def test_from_dict_refuses_a_short_history(self):
+        """Dropping rotated secrets would silently stop old signatures verifying."""
+        agent = AgentIdentity.generate("fp-7", "Fingerprint")
+        old_secret = agent.private_key
+        agent.rotate_key()
+        d = agent.to_dict()
+        self.assertEqual(d["key_generation"], 1)
+        with self.assertRaises(ValueError):
+            AgentIdentity.from_dict(d, agent.private_key)
+        restored = AgentIdentity.from_dict(d, agent.private_key, [old_secret])
+        sig = AgentIdentity(agent.agent_id, agent.name, agent.key_fingerprint,
+                            old_secret).sign(b"pre-rotation")
+        self.assertTrue(restored.verify(b"pre-rotation", sig))
+
+
+class TestStateRoundTrip(unittest.TestCase):
+    """export_state() with no inverse leaves an exported signature unverifiable."""
+
+    def _engine_with_a_signature(self):
+        engine = SigningEngine()
+        agent = AgentIdentity.generate("rt-1", "RoundTrip")
+        engine.register_agent(agent)
+        engine.sign_program("rt-1", _make_bytecode(7))
+        return engine, agent
+
+    def test_exported_signature_verifies_after_import(self):
+        engine, agent = self._engine_with_a_signature()
+        bc = _make_bytecode(7)
+        self.assertEqual(engine.verify_program(bc)[0], SignatureStatus.VALID)
+
+        state = engine.export_state()
+        restored = engine.import_state(state, {"rt-1": agent.private_key})
+        status, msg = restored.verify_program(bc)
+        self.assertEqual(status, SignatureStatus.VALID, msg)
+
+    def test_export_carries_no_secret(self):
+        engine, agent = self._engine_with_a_signature()
+        state = engine.export_state()
+        self.assertNotIn(agent.private_key, json.dumps(state))
+
+    def test_import_refuses_without_a_secret(self):
+        engine, _ = self._engine_with_a_signature()
+        with self.assertRaises(ValueError) as ctx:
+            engine.import_state(engine.export_state(), {})
+        self.assertIn("rt-1", str(ctx.exception))
+
+    def test_import_refuses_the_wrong_secret(self):
+        engine, _ = self._engine_with_a_signature()
+        with self.assertRaises(ValueError):
+            engine.import_state(engine.export_state(), {"rt-1": "not-the-secret"})
+
+    def test_import_preserves_chain_and_revocations(self):
+        engine = SigningEngine()
+        agent = AgentIdentity.generate("rt-2", "Chain")
+        engine.register_agent(agent)
+        bc = _make_bytecode(9)
+        engine.sign_program("rt-2", bc)
+        ph = engine.hash_bytecode(bc)
+        engine.revoke_signature(ph, "rt-2", "admin", "compromised")
+        engine.snapshot_chain()
+
+        state = engine.export_state()
+        restored = engine.import_state(state, {"rt-2": agent.private_key})
+
+        ok, msg = restored.verify_chain()
+        self.assertTrue(ok, msg)
+        self.assertEqual(len(restored.get_revocations(program_hash=ph)), 1)
+        self.assertEqual(restored.get_revocations(program_hash=ph)[0].reason, "compromised")
+        self.assertEqual(restored.verify_program(bc)[0], SignatureStatus.REVOKED)
+        self.assertEqual(len(restored.audit_log), len(engine.audit_log))
+
+    def test_import_keeps_pre_rotation_signatures_verifiable(self):
+        engine = SigningEngine()
+        agent = AgentIdentity.generate("rt-3", "Rotator")
+        engine.register_agent(agent)
+        bc = _make_bytecode(11)
+        old_secret = agent.private_key
+        engine.sign_program("rt-3", bc)          # signed under generation 0
+        engine.rotate_agent_key("rt-3")
+
+        state = engine.export_state()
+        with self.assertRaises(ValueError):
+            engine.import_state(state, {"rt-3": agent.private_key})
+        restored = engine.import_state(
+            state, {"rt-3": agent.private_key}, {"rt-3": [old_secret]}
+        )
+        status, msg = restored.verify_program(bc)
+        self.assertEqual(status, SignatureStatus.VALID, msg)
 
 
 if __name__ == "__main__":
